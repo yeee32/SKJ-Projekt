@@ -1,3 +1,5 @@
+from typing import Any, Literal
+
 from pydantic import BaseModel, Field
 
 class FileMeta(BaseModel):
@@ -59,3 +61,26 @@ class BucketBillingResponse(BaseModel):
     model_config = {
         "from_attributes": True
     }
+
+
+class BrokerSubscribeMessage(BaseModel):
+    action: Literal["subscribe"]
+    topic: str = Field(..., min_length=1)
+
+
+class BrokerPublishMessage(BaseModel):
+    action: Literal["publish"]
+    topic: str = Field(..., min_length=1)
+    payload: dict[str, Any]
+
+
+class BrokerAckMessage(BaseModel):
+    action: Literal["ack"]
+    message_id: int = Field(..., gt=0)
+
+
+class BrokerDeliverMessage(BaseModel):
+    action: Literal["deliver"]
+    topic: str
+    message_id: int
+    payload: dict[str, Any]

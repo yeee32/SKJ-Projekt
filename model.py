@@ -1,4 +1,4 @@
-from sqlalchemy import Boolean, ForeignKey, Column, String, Integer
+from sqlalchemy import Boolean, ForeignKey, Column, String, Integer, LargeBinary, DateTime
 from sqlalchemy.orm import relationship, declarative_base
 from datetime import datetime
 
@@ -38,3 +38,14 @@ class Bucket(Base):
     files = relationship("FileModel", back_populates="bucket")
 
 
+class QueuedMessage(Base):
+    __tablename__ = "queued_messages"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    topic = Column(String, nullable=False, index=True)
+
+    payload = Column(LargeBinary, nullable=False)
+
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+    is_delivered = Column(Boolean, nullable=False, default=False, index=True)

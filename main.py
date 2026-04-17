@@ -1,14 +1,18 @@
 import uuid
+import json
+import asyncio
 from datetime import datetime
 from pathlib import Path
 
+import msgpack
+import itertools
 import aiofiles
-from fastapi import FastAPI, File, UploadFile, HTTPException, Header, Depends, Request
+from fastapi import FastAPI, File, UploadFile, HTTPException, Header, Depends, Request, WebSocket, WebSocketDisconnect
+from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import FileResponse
-from fastapi.routing import APIRoute
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, event, func
 from sqlalchemy.orm import sessionmaker, Session
-from model import Base, FileModel, Bucket
+from model import Base, FileModel, Bucket, QueuedMessage
 from schemas import *
 
 app = FastAPI(title="Object Storage Service", version="2.0.0")
@@ -16,35 +20,259 @@ app = FastAPI(title="Object Storage Service", version="2.0.0")
 # ======================
 # DB SETUP
 # ======================
-
 DATABASE_URL = "sqlite:///./files.db"
+engine = create_engine(DATABASE_URL, connect_args={"check_same_thread": False}, echo=False)
+SessionLocal = sessionmaker(bind=engine, expire_on_commit=False, autoflush=False)
 
-engine = create_engine(DATABASE_URL, connect_args={"check_same_thread": False}, echo=True)
-SessionLocal = sessionmaker(bind=engine)
+message_queue = asyncio.Queue()
+ack_queue = asyncio.Queue()
+message_id_counter = itertools.count(1)
 
-
+@event.listens_for(engine, "connect")
+def set_sqlite_pragmas(dbapi_connection, connection_record):
+    cursor = dbapi_connection.cursor()
+    cursor.execute("PRAGMA journal_mode=WAL;")
+    cursor.execute("PRAGMA synchronous=NORMAL;")
+    cursor.close()
 
 def get_db():
     db = SessionLocal()
+    try: yield db
+    finally: db.close()
+
+# ======================
+# MESSAGE BROKER – CONNECTION MANAGER
+# ======================
+class ConnectionManager:
+    def __init__(self):
+        self.active_connections: dict[str, set[WebSocket]] = {}
+        self.socket_format: dict[WebSocket, str] = {}
+        self.queues: dict[WebSocket, asyncio.Queue] = {}
+        self.tasks: dict[WebSocket, asyncio.Task] = {}
+
+    async def connect(self, websocket: WebSocket):
+        await websocket.accept()
+        self.socket_format[websocket] = "json"
+        # Fronta pro odchozí zprávy (neomezená pro benchmark)
+        q = asyncio.Queue()
+        self.queues[websocket] = q
+        # Dedikovaný task pro odesílání na tento socket
+        self.tasks[websocket] = asyncio.create_task(self._writer_task(websocket, q))
+
+    async def _writer_task(self, ws: WebSocket, q: asyncio.Queue):
+        """Writer task zabraňuje AssertionError a WinError 64."""
+        try:
+            while True:
+                data = await q.get()
+                try:
+                    if isinstance(data, bytes):
+                        await ws.send_bytes(data)
+                    else:
+                        await ws.send_text(data)
+                    # ✅ Uvolníme loop pro Windows
+                    await asyncio.sleep(0)
+                except:
+                    break
+                finally:
+                    q.task_done()
+        except asyncio.CancelledError:
+            pass
+        finally:
+            # Cleanup socketu proběhne v disconnect_all
+            pass
+
+    def disconnect_all(self, websocket: WebSocket):
+        # Zrušení tasku a vymazání fronty
+        t = self.tasks.pop(websocket, None)
+        if t: t.cancel()
+        self.queues.pop(websocket, None)
+        self.socket_format.pop(websocket, None)
+        for topic in list(self.active_connections.keys()):
+            if websocket in self.active_connections[topic]:
+                self.active_connections[topic].discard(websocket)
+
+    def subscribe(self, websocket: WebSocket, topic: str):
+        if topic not in self.active_connections:
+            self.active_connections[topic] = set()
+        self.active_connections[topic].add(websocket)
+
+    def send_to(self, websocket: WebSocket, payload: dict):
+        """Okamžitě zařadí zprávu do fronty (neblokuje)."""
+        q = self.queues.get(websocket)
+        if not q: return
+        fmt = self.socket_format.get(websocket, "json")
+        try:
+            data = msgpack.packb(payload, use_bin_type=True) if fmt == "msgpack" else json.dumps(payload)
+            q.put_nowait(data)
+        except: pass
+
+    async def broadcast(self, payload: dict, topic: str, sender=None):
+        subscribers = self.active_connections.get(topic, set())
+        if not subscribers: return 0
+
+        j_data = m_data = None  # lazy
+
+        count = 0
+        for ws in list(subscribers):
+            if ws is sender: continue
+            q = self.queues.get(ws)
+            if not q: continue
+            fmt = self.socket_format.get(ws, "json")
+            if fmt == "msgpack":
+                if m_data is None:
+                    m_data = msgpack.packb(payload, use_bin_type=True)
+                q.put_nowait(m_data)
+            else:
+                if j_data is None:
+                    j_data = json.dumps(payload)
+                q.put_nowait(j_data)
+            count += 1
+        return count
+
+manager = ConnectionManager()
+
+# ✅ DB FUNKCE
+def db_store_messages_batch(messages):
+    db = SessionLocal()
     try:
-        yield db
+        objs = [QueuedMessage(id=mid, topic=t, payload=json.dumps(p).encode("utf-8")) for t, p, mid in messages]
+        db.add_all(objs)
+        db.commit()
+    finally: db.close()
+
+def db_ack_messages_batch(ids):
+    db = SessionLocal()
+    try:
+        db.query(QueuedMessage).filter(QueuedMessage.id.in_(ids)).update({"is_delivered": True}, synchronize_session=False)
+        db.commit()
+    finally: db.close()
+
+async def message_db_worker():
+    while True:
+        try:
+            m = await message_queue.get()
+            batch = [m]
+            while len(batch) < 1000:
+                try:
+                    batch.append(message_queue.get_nowait())
+                except asyncio.QueueEmpty:
+                    break
+            await run_in_threadpool(db_store_messages_batch, batch)
+            for _ in range(len(batch)):
+                message_queue.task_done()
+        except Exception as e:
+            print(f"message_db_worker error: {e}")
+            await asyncio.sleep(0.1)
+
+async def ack_db_worker():
+    while True:
+        try:
+            a = await ack_queue.get()
+            batch = [a]
+            while len(batch) < 1000:
+                try:
+                    batch.append(ack_queue.get_nowait())
+                except asyncio.QueueEmpty:
+                    break
+            await run_in_threadpool(db_ack_messages_batch, batch)
+            for _ in range(len(batch)):
+                ack_queue.task_done()
+        except Exception as e:
+            print(f"ack_db_worker error: {e}")
+            await asyncio.sleep(0.1)
+
+def db_load_undelivered(topic: str):
+    db = SessionLocal()
+    try: return db.query(QueuedMessage).filter(QueuedMessage.topic == topic, QueuedMessage.is_delivered == False).all()
+    finally: db.close()
+
+def get_max_id_from_db():
+    db = SessionLocal()
+    try:
+        res = db.query(func.max(QueuedMessage.id)).scalar()
+        return int(res) if res else 0
+    except: return 0
+    finally: db.close()
+
+@app.on_event("startup")
+async def startup_event():
+    global message_id_counter
+    start_id = await run_in_threadpool(get_max_id_from_db)
+    message_id_counter = itertools.count(start_id + 1)
+    asyncio.create_task(message_db_worker())
+    asyncio.create_task(ack_db_worker())
+
+# ======================
+# WEBSOCKET ENDPOINT – BROKER
+# ======================
+
+async def send_undelivered(websocket: WebSocket, topic: str):
+    """Načte undelivered zprávy z DB a pošle je subscriberovi na pozadí."""
+    try:
+        undelivered = await run_in_threadpool(db_load_undelivered, topic)
+        for row in undelivered:
+            try:
+                p_h = json.loads(row.payload.decode("utf-8"))
+                manager.send_to(websocket, {
+                    "action": "deliver",
+                    "topic": row.topic,
+                    "message_id": row.id,
+                    "payload": p_h,
+                })
+            except:
+                continue
+    except Exception as e:
+        print(f"send_undelivered error: {e}")
+
+@app.websocket("/broker")
+async def broker_endpoint(websocket: WebSocket):
+    await manager.connect(websocket)
+    try:
+        while True:
+            # Maximální priorita pro čtení (aby nedocházelo k ping timeout)
+            msg = await websocket.receive()
+            
+            if msg.get("type") == "websocket.disconnect": break
+            
+            try:
+                if "text" in msg:
+                    manager.socket_format[websocket] = "json"
+                    data = json.loads(msg["text"])
+                elif "bytes" in msg:
+                    manager.socket_format[websocket] = "msgpack"
+                    data = msgpack.unpackb(msg["bytes"], raw=False)
+                else: continue
+            except: continue
+
+            action = data.get("action")
+
+            if action == "publish":
+                t, p = data.get("topic"), data.get("payload")
+                if t:
+                    mid = next(message_id_counter)
+                    message_queue.put_nowait((t, p, mid))
+                    recipients = await manager.broadcast({"action":"deliver","topic":t,"message_id":mid,"payload":p}, t, sender=websocket)
+                    manager.send_to(websocket, {"status":"published","topic":t,"message_id":mid,"recipients":recipients})
+
+            elif action == "subscribe":
+                topic = data.get("topic")
+                if topic:
+                    manager.subscribe(websocket, topic)
+                    manager.send_to(websocket, {"status": "subscribed", "topic": topic})
+
+                    asyncio.create_task(send_undelivered(websocket, topic))
+
+
+            elif action == "ack":
+                mid = data.get("message_id")
+                if mid:
+                    await ack_queue.put(mid)
+                    manager.send_to(websocket, {"status": "acknowledged", "message_id": mid})
+
+    except WebSocketDisconnect: pass
+    except: pass
     finally:
-        db.close()
-
-
-# ======================
-# STORAGE
-# ======================
-
-STORAGE_ROOT = Path("storage")
-
-
-def get_user_dir(user_id: str) -> Path:
-    path = STORAGE_ROOT / user_id
-    path.mkdir(parents=True, exist_ok=True)
-    return path
-
-
+        manager.disconnect_all(websocket)
 # ======================
 # MIDDLEWARE – API REQUEST BILLING
 # ======================
