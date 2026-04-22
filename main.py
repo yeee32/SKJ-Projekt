@@ -3,19 +3,28 @@ import json
 import asyncio
 from datetime import datetime
 from pathlib import Path
+from typing import Any
 
 import msgpack
 import itertools
 import aiofiles
 from fastapi import FastAPI, File, UploadFile, HTTPException, Header, Depends, Request, WebSocket, WebSocketDisconnect
 from fastapi.concurrency import run_in_threadpool
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
+from pydantic import BaseModel
 from sqlalchemy import create_engine, event, func
 from sqlalchemy.orm import sessionmaker, Session
 from model import Base, FileModel, Bucket, QueuedMessage
 from schemas import *
 
 app = FastAPI(title="Object Storage Service", version="2.0.0")
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 # ======================
 # DB SETUP
@@ -40,6 +49,11 @@ def get_db():
     try: yield db
     finally: db.close()
 
+def get_user_dir(user_id: str) -> Path:
+    p = Path("uploads") / user_id
+    p.mkdir(parents=True, exist_ok=True)
+    return p
+
 # ======================
 # MESSAGE BROKER – CONNECTION MANAGER
 # ======================
@@ -53,14 +67,11 @@ class ConnectionManager:
     async def connect(self, websocket: WebSocket):
         await websocket.accept()
         self.socket_format[websocket] = "json"
-        # Fronta pro odchozí zprávy (neomezená pro benchmark)
         q = asyncio.Queue()
         self.queues[websocket] = q
-        # Dedikovaný task pro odesílání na tento socket
         self.tasks[websocket] = asyncio.create_task(self._writer_task(websocket, q))
 
     async def _writer_task(self, ws: WebSocket, q: asyncio.Queue):
-        """Writer task zabraňuje AssertionError a WinError 64."""
         try:
             while True:
                 data = await q.get()
@@ -69,7 +80,6 @@ class ConnectionManager:
                         await ws.send_bytes(data)
                     else:
                         await ws.send_text(data)
-                    # ✅ Uvolníme loop pro Windows
                     await asyncio.sleep(0)
                 except:
                     break
@@ -77,12 +87,8 @@ class ConnectionManager:
                     q.task_done()
         except asyncio.CancelledError:
             pass
-        finally:
-            # Cleanup socketu proběhne v disconnect_all
-            pass
 
     def disconnect_all(self, websocket: WebSocket):
-        # Zrušení tasku a vymazání fronty
         t = self.tasks.pop(websocket, None)
         if t: t.cancel()
         self.queues.pop(websocket, None)
@@ -97,7 +103,6 @@ class ConnectionManager:
         self.active_connections[topic].add(websocket)
 
     def send_to(self, websocket: WebSocket, payload: dict):
-        """Okamžitě zařadí zprávu do fronty (neblokuje)."""
         q = self.queues.get(websocket)
         if not q: return
         fmt = self.socket_format.get(websocket, "json")
@@ -110,7 +115,7 @@ class ConnectionManager:
         subscribers = self.active_connections.get(topic, set())
         if not subscribers: return 0
 
-        j_data = m_data = None  # lazy
+        j_data = m_data = None
 
         count = 0
         for ws in list(subscribers):
@@ -131,7 +136,7 @@ class ConnectionManager:
 
 manager = ConnectionManager()
 
-# ✅ DB FUNKCE
+# DB FUNKCE
 def db_store_messages_batch(messages):
     db = SessionLocal()
     try:
@@ -196,6 +201,7 @@ def get_max_id_from_db():
 
 @app.on_event("startup")
 async def startup_event():
+    Base.metadata.create_all(bind=engine)
     global message_id_counter
     start_id = await run_in_threadpool(get_max_id_from_db)
     message_id_counter = itertools.count(start_id + 1)
@@ -207,7 +213,6 @@ async def startup_event():
 # ======================
 
 async def send_undelivered(websocket: WebSocket, topic: str):
-    """Načte undelivered zprávy z DB a pošle je subscriberovi na pozadí."""
     try:
         undelivered = await run_in_threadpool(db_load_undelivered, topic)
         for row in undelivered:
@@ -229,11 +234,10 @@ async def broker_endpoint(websocket: WebSocket):
     await manager.connect(websocket)
     try:
         while True:
-            # Maximální priorita pro čtení (aby nedocházelo k ping timeout)
             msg = await websocket.receive()
-            
+
             if msg.get("type") == "websocket.disconnect": break
-            
+
             try:
                 if "text" in msg:
                     manager.socket_format[websocket] = "json"
@@ -259,9 +263,7 @@ async def broker_endpoint(websocket: WebSocket):
                 if topic:
                     manager.subscribe(websocket, topic)
                     manager.send_to(websocket, {"status": "subscribed", "topic": topic})
-
                     asyncio.create_task(send_undelivered(websocket, topic))
-
 
             elif action == "ack":
                 mid = data.get("message_id")
@@ -273,6 +275,8 @@ async def broker_endpoint(websocket: WebSocket):
     except: pass
     finally:
         manager.disconnect_all(websocket)
+
+
 # ======================
 # MIDDLEWARE – API REQUEST BILLING
 # ======================
@@ -311,6 +315,15 @@ async def count_api_requests(request: Request, call_next):
 
 
 # ======================
+# SCHEMAS (lokální – pro process endpoint)
+# ======================
+
+class ProcessRequest(BaseModel):
+    operation: str
+    params: dict[str, Any] = {}
+
+
+# ======================
 # ENDPOINTS
 # ======================
 
@@ -345,7 +358,7 @@ async def upload_file(
         path=str(dest_path),
         size=size,
         created_at=datetime.utcnow().isoformat(),
-        bucket_id=bucket_id  
+        bucket_id=bucket_id
     )
 
     db.add(db_file)
@@ -369,6 +382,7 @@ async def upload_file(
         size=db_file.size
     )
 
+
 @app.post("/buckets", response_model=BucketResponse)
 def create_bucket(
     bucket: BucketCreate,
@@ -389,6 +403,7 @@ def create_bucket(
 
     return new_bucket
 
+
 @app.get("/buckets/{bucket_id}/objects", response_model=BucketObjectsResponse)
 def list_bucket_files(
     bucket_id: str,
@@ -403,6 +418,71 @@ def list_bucket_files(
         bucket_id=bucket_id,
         files=[FileMeta.model_validate(f) for f in files]
     )
+
+
+# ======================
+# NOVÝ ENDPOINT – IMAGE PROCESSING
+# ======================
+
+@app.post(
+    "/buckets/{bucket_id}/objects/{file_id}/process",
+    summary="Spustit image processing úlohu (asynchronní)"
+)
+async def process_image(
+    bucket_id: str,
+    file_id: str,
+    body: ProcessRequest,
+    x_user_id: str = Header(default="anonymous"),
+    db: Session = Depends(get_db),
+):
+    """
+    Zařadí úlohu zpracování obrázku do fronty (image.jobs).
+    Worker ji asynchronně zpracuje a výsledek odešle do image.done.
+
+    Podporované operace:
+      - invert      … inverze barev
+      - flip        … horizontální překlopení
+      - grayscale   … převod do odstínů šedi
+      - brightness  … úprava jasu (params: {"delta": 50})
+      - crop        … ořez (params: {"top":10,"left":10,"bottom":10,"right":10})
+    """
+    # Ověřit existenci souboru a přístupová práva
+    record = db.query(FileModel).filter(FileModel.id == file_id).first()
+    if not record:
+        raise HTTPException(status_code=404, detail="Soubor nenalezen")
+    if record.user_id != x_user_id:
+        raise HTTPException(status_code=403, detail="Přístup odepřen")
+
+    # Sestavit job payload
+    job_id = str(uuid.uuid4())
+    job_payload = {
+        "job_id":    job_id,
+        "file_id":   file_id,
+        "bucket_id": bucket_id,
+        "user_id":   x_user_id,
+        "operation": body.operation,
+        "params":    body.params,
+    }
+
+    # Uložit do DB a doručit aktivním subscriberům
+    mid = next(message_id_counter)
+    message_queue.put_nowait(("image.jobs", job_payload, mid))
+    await manager.broadcast(
+        {
+            "action":     "deliver",
+            "topic":      "image.jobs",
+            "message_id": mid,
+            "payload":    job_payload,
+        },
+        "image.jobs",
+    )
+
+    return {"status": "processing_started", "job_id": job_id, "message_id": mid}
+
+
+# ======================
+# OSTATNÍ ENDPOINTY (beze změny)
+# ======================
 
 @app.get("/files", response_model=FileListResponse)
 def list_files(
@@ -419,10 +499,7 @@ def list_files(
     )
 
 
-@app.get(
-    "/files/{file_id}",
-    summary="Download file"
-)
+@app.get("/files/{file_id}", summary="Download file")
 def download_file(
     file_id: str,
     x_user_id: str = Header(default="anonymous"),
@@ -443,7 +520,6 @@ def download_file(
     if not file_path.exists():
         raise HTTPException(status_code=404, detail="File missing from disk")
 
-    # Billing – egress nebo internal
     if record.bucket_id:
         bucket = db.query(Bucket).filter(Bucket.id == record.bucket_id).first()
         if bucket:
@@ -460,11 +536,7 @@ def download_file(
     )
 
 
-@app.delete(
-    "/files/{file_id}",
-    status_code=204,
-    summary="Delete file"
-)
+@app.delete("/files/{file_id}", status_code=204, summary="Delete file")
 def delete_file(
     file_id: str,
     x_user_id: str = Header(default="anonymous"),
@@ -481,17 +553,15 @@ def delete_file(
     if record.bucket_id:
         bucket = db.query(Bucket).filter(Bucket.id == record.bucket_id).first()
         if bucket:
-            # Při soft delete storage NEKLESÁ – soubor fyzicky stále existuje
-            # current_storage_bytes se sníží až při případném hard delete
             db.add(bucket)
 
     record.is_deleted = True
     db.commit()
 
+
 @app.get("/buckets", response_model=BucketListResponse)
 def list_buckets(db: Session = Depends(get_db)):
     buckets = db.query(Bucket).all()
-    
     return BucketListResponse(buckets=buckets)
 
 
@@ -501,7 +571,7 @@ def get_bucket_billing(
     db: Session = Depends(get_db)
 ):
     bucket = db.query(Bucket).filter(Bucket.id == bucket_id).first()
-    
+
     if not bucket:
         raise HTTPException(status_code=404, detail="Bucket not found")
 

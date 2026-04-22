@@ -1,0 +1,470 @@
+<!DOCTYPE html>
+<html lang="cs">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Image Processing Studio</title>
+<style>
+  @import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500&family=Syne:wght@400;500;600&display=swap');
+
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+  :root {
+    --bg:        #0e0e10;
+    --surface:   #17171a;
+    --surface2:  #1f1f23;
+    --border:    rgba(255,255,255,0.07);
+    --border2:   rgba(255,255,255,0.13);
+    --text:      #f0f0f2;
+    --muted:     #6b6b74;
+    --accent:    #7c6dfa;
+    --accent-dim:#3d3580;
+    --green:     #3ddc84;
+    --green-dim: #1a3d2a;
+    --red:       #ff5c5c;
+    --red-dim:   #3d1a1a;
+    --amber:     #f5a623;
+    --amber-dim: #3d2a0a;
+    --radius:    10px;
+    --radius-lg: 14px;
+  }
+
+  html, body { background: var(--bg); color: var(--text); font-family: 'Syne', sans-serif; min-height: 100vh; }
+
+  .layout {
+    max-width: 960px;
+    margin: 0 auto;
+    padding: 2.5rem 1.5rem;
+    display: grid;
+    grid-template-columns: 1fr 340px;
+    grid-template-rows: auto;
+    gap: 1rem;
+  }
+
+  /* ── header ── */
+  .header {
+    grid-column: 1 / -1;
+    display: flex;
+    align-items: baseline;
+    gap: 14px;
+    padding-bottom: 1.5rem;
+    border-bottom: 1px solid var(--border);
+    margin-bottom: 0.5rem;
+  }
+  .header h1 { font-size: 22px; font-weight: 600; letter-spacing: -0.02em; color: var(--text); }
+  .header .badge {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 11px;
+    color: var(--accent);
+    background: rgba(124,109,250,0.12);
+    border: 1px solid rgba(124,109,250,0.25);
+    border-radius: 20px;
+    padding: 2px 10px;
+  }
+
+  /* ── cards ── */
+  .card {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-lg);
+    padding: 1.25rem;
+  }
+
+  .label {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 10px;
+    font-weight: 500;
+    letter-spacing: 0.1em;
+    text-transform: uppercase;
+    color: var(--muted);
+    margin-bottom: 10px;
+  }
+
+  /* ── left column ── */
+  .col-left { display: flex; flex-direction: column; gap: 1rem; }
+  .col-right { display: flex; flex-direction: column; gap: 1rem; }
+
+  /* ── upload ── */
+  .upload-zone {
+    border: 1.5px dashed var(--border2);
+    border-radius: var(--radius);
+    padding: 2.5rem 1rem;
+    text-align: center;
+    cursor: pointer;
+    transition: border-color 0.15s, background 0.15s;
+    position: relative;
+  }
+  .upload-zone:hover, .upload-zone.drag { border-color: var(--accent); background: rgba(124,109,250,0.05); }
+  .upload-zone input { position: absolute; inset: 0; opacity: 0; cursor: pointer; }
+  .upload-icon { margin: 0 auto 12px; width: 36px; height: 36px; opacity: 0.35; }
+  .upload-zone p { font-size: 14px; color: var(--muted); }
+  .upload-zone .hint { font-size: 11px; font-family: 'JetBrains Mono', monospace; color: var(--muted); opacity: 0.6; margin-top: 5px; }
+
+  .preview-wrap { margin-top: 12px; position: relative; }
+  .preview-img { width: 100%; max-height: 300px; object-fit: contain; border-radius: var(--radius); display: block; background: var(--surface2); }
+  .preview-meta { display: flex; justify-content: space-between; margin-top: 6px; font-size: 11px; font-family: 'JetBrains Mono', monospace; color: var(--muted); }
+
+  /* ── ops ── */
+  .ops-grid { display: grid; grid-template-columns: repeat(5, 1fr); gap: 6px; }
+  .op-btn {
+    background: var(--surface2);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: 10px 4px 8px;
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 10px;
+    color: var(--muted);
+    cursor: pointer;
+    text-align: center;
+    transition: all 0.12s;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 5px;
+  }
+  .op-btn:hover { border-color: var(--border2); color: var(--text); background: rgba(255,255,255,0.04); }
+  .op-btn.active { border-color: var(--accent); color: var(--accent); background: rgba(124,109,250,0.1); }
+  .op-icon { font-size: 17px; line-height: 1; }
+
+  .params-area { margin-top: 14px; }
+  .params-row { display: flex; align-items: center; gap: 10px; }
+  .params-row label { font-size: 12px; font-family: 'JetBrains Mono', monospace; color: var(--muted); white-space: nowrap; }
+  .params-row input[type=range] { flex: 1; accent-color: var(--accent); }
+  .params-row .val { font-size: 12px; font-family: 'JetBrains Mono', monospace; font-weight: 500; color: var(--accent); min-width: 40px; text-align: right; }
+
+  .crop-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+  .crop-field { display: flex; flex-direction: column; gap: 4px; }
+  .crop-field label { font-size: 11px; font-family: 'JetBrains Mono', monospace; color: var(--muted); }
+  .crop-field input[type=number] {
+    background: var(--surface2);
+    border: 1px solid var(--border2);
+    border-radius: 6px;
+    padding: 6px 8px;
+    font-size: 13px;
+    font-family: 'JetBrains Mono', monospace;
+    color: var(--text);
+    width: 100%;
+  }
+  .crop-field input[type=number]:focus { outline: none; border-color: var(--accent); }
+
+  .no-params { font-size: 11px; font-family: 'JetBrains Mono', monospace; color: var(--muted); opacity: 0.5; }
+
+  /* ── config ── */
+  .config-field { display: flex; flex-direction: column; gap: 5px; margin-bottom: 10px; }
+  .config-field:last-child { margin-bottom: 0; }
+  .config-field label { font-size: 11px; font-family: 'JetBrains Mono', monospace; color: var(--muted); }
+  .config-field input {
+    background: var(--surface2);
+    border: 1px solid var(--border2);
+    border-radius: 6px;
+    padding: 7px 10px;
+    font-size: 12px;
+    font-family: 'JetBrains Mono', monospace;
+    color: var(--text);
+    width: 100%;
+  }
+  .config-field input:focus { outline: none; border-color: var(--accent); }
+
+  /* ── result ── */
+  .result-empty { display: flex; flex-direction: column; align-items: center; justify-content: center; min-height: 180px; gap: 8px; }
+  .result-empty p { font-size: 12px; font-family: 'JetBrains Mono', monospace; color: var(--muted); opacity: 0.5; }
+  .result-img { width: 100%; max-height: 260px; object-fit: contain; border-radius: var(--radius); display: block; background: var(--surface2); }
+  .result-meta { display: flex; justify-content: space-between; margin-top: 8px; font-size: 11px; font-family: 'JetBrains Mono', monospace; color: var(--muted); }
+  .result-op { color: var(--accent); }
+
+  /* ── submit ── */
+  .submit-btn {
+    width: 100%;
+    padding: 12px;
+    font-family: 'Syne', sans-serif;
+    font-size: 14px;
+    font-weight: 600;
+    background: var(--accent);
+    color: #fff;
+    border: none;
+    border-radius: var(--radius);
+    cursor: pointer;
+    transition: opacity 0.15s, transform 0.1s;
+    letter-spacing: 0.01em;
+  }
+  .submit-btn:hover:not(:disabled) { opacity: 0.88; }
+  .submit-btn:active:not(:disabled) { transform: scale(0.99); }
+  .submit-btn:disabled { opacity: 0.3; cursor: not-allowed; }
+
+  /* ── status ── */
+  .status-bar {
+    font-size: 12px;
+    font-family: 'JetBrains Mono', monospace;
+    padding: 9px 12px;
+    border-radius: var(--radius);
+    line-height: 1.5;
+  }
+  .status-bar.info    { background: rgba(124,109,250,0.12); color: #b0a6ff; border: 1px solid rgba(124,109,250,0.2); }
+  .status-bar.success { background: var(--green-dim); color: var(--green); border: 1px solid rgba(61,220,132,0.2); }
+  .status-bar.error   { background: var(--red-dim); color: var(--red); border: 1px solid rgba(255,92,92,0.2); }
+
+  /* ── uploaded badge ── */
+  .uploaded-badge {
+    margin-top: 8px;
+    font-size: 11px;
+    font-family: 'JetBrains Mono', monospace;
+    color: var(--green);
+    background: var(--green-dim);
+    border: 1px solid rgba(61,220,132,0.2);
+    border-radius: 6px;
+    padding: 6px 10px;
+    display: none;
+  }
+
+  /* ── spinner ── */
+  .spinner {
+    display: inline-block;
+    width: 13px; height: 13px;
+    border: 2px solid rgba(255,255,255,0.15);
+    border-top-color: #fff;
+    border-radius: 50%;
+    animation: spin 0.65s linear infinite;
+    vertical-align: middle;
+    margin-right: 7px;
+  }
+  @keyframes spin { to { transform: rotate(360deg); } }
+
+  @media (max-width: 700px) {
+    .layout { grid-template-columns: 1fr; }
+    .ops-grid { grid-template-columns: repeat(5, 1fr); }
+  }
+</style>
+</head>
+<body>
+
+<div class="layout">
+  <!-- LEFT -->
+  <div class="col-left">
+
+    <div class="card">
+      <p class="label">Obrázek</p>
+      <div class="upload-zone" id="uploadZone">
+        <input type="file" id="fileInput" accept="image/*" />
+        <svg class="upload-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
+          <path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4M17 8l-5-5-5 5M12 3v12"/>
+        </svg>
+        <p>Přetáhni nebo klikni</p>
+        <p class="hint">JPG · PNG · WEBP</p>
+      </div>
+      <div class="preview-wrap" id="previewWrap" style="display:none">
+        <img id="previewImg" class="preview-img" />
+        <div class="preview-meta">
+          <span id="previewName"></span>
+          <span id="previewSize"></span>
+        </div>
+      </div>
+      <div class="uploaded-badge" id="uploadedBadge"></div>
+    </div>
+
+    <div class="card">
+      <p class="label">Operace</p>
+      <div class="ops-grid" id="opsGrid">
+        <button class="op-btn active" data-op="grayscale"><span class="op-icon">◑</span>gray</button>
+        <button class="op-btn" data-op="invert"><span class="op-icon">◐</span>invert</button>
+        <button class="op-btn" data-op="flip"><span class="op-icon">⇆</span>flip</button>
+        <button class="op-btn" data-op="brightness"><span class="op-icon">☀</span>jas</button>
+        <button class="op-btn" data-op="crop"><span class="op-icon">⊡</span>crop</button>
+      </div>
+      <div class="params-area" id="paramsArea"></div>
+    </div>
+
+    <button class="submit-btn" id="submitBtn" disabled>Zpracovat obrázek</button>
+    <div id="statusArea"></div>
+
+  </div>
+
+  <!-- RIGHT -->
+  <div class="col-right">
+
+    <div class="card">
+      <p class="label">Výsledek</p>
+      <div id="resultEmpty" class="result-empty">
+        <svg width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1" style="opacity:0.15">
+          <rect x="3" y="3" width="18" height="18" rx="2"/><path d="M3 15l5-5 4 4 3-3 6 6"/><circle cx="8.5" cy="8.5" r="1.5"/>
+        </svg>
+        <p>výsledek se zobrazí zde</p>
+      </div>
+      <div id="resultContent" style="display:none">
+        <img id="resultImg" class="result-img" />
+        <div class="result-meta">
+          <span class="result-op" id="resultOp"></span>
+          <span id="resultFileId"></span>
+        </div>
+      </div>
+    </div>
+
+    <div class="card">
+      <p class="label">Připojení</p>
+      <div class="config-field">
+        <label>API base URL</label>
+        <input type="text" id="apiBase" value="http://localhost:8000" />
+      </div>
+      <div class="config-field">
+        <label>User ID</label>
+        <input type="text" id="userId" value="test-user" />
+      </div>
+    </div>
+
+  </div>
+
+</div>
+
+<script>
+const $ = id => document.getElementById(id);
+let selectedOp = 'grayscale';
+let uploadedFileId = null;
+let currentFile = null;
+
+$('opsGrid').querySelectorAll('.op-btn').forEach(btn => {
+  btn.addEventListener('click', () => {
+    $('opsGrid').querySelectorAll('.op-btn').forEach(b => b.classList.remove('active'));
+    btn.classList.add('active');
+    selectedOp = btn.dataset.op;
+    renderParams();
+  });
+});
+
+function renderParams() {
+  const area = $('paramsArea');
+  if (selectedOp === 'brightness') {
+    area.innerHTML = `<div class="params-row"><label>delta</label><input type="range" id="deltaSlider" min="-255" max="255" value="50" step="1"><span class="val" id="deltaVal">+50</span></div>`;
+    const s = $('deltaSlider'), v = $('deltaVal');
+    s.addEventListener('input', () => { v.textContent = (s.value > 0 ? '+' : '') + s.value; });
+  } else if (selectedOp === 'crop') {
+    area.innerHTML = `<div class="crop-grid">
+      <div class="crop-field"><label>top px</label><input type="number" id="cropTop" value="10" min="0"></div>
+      <div class="crop-field"><label>left px</label><input type="number" id="cropLeft" value="10" min="0"></div>
+      <div class="crop-field"><label>bottom px</label><input type="number" id="cropBottom" value="10" min="0"></div>
+      <div class="crop-field"><label>right px</label><input type="number" id="cropRight" value="10" min="0"></div>
+    </div>`;
+  } else {
+    area.innerHTML = `<p class="no-params">— žádné parametry —</p>`;
+  }
+}
+renderParams();
+
+function getParams() {
+  if (selectedOp === 'brightness') return { delta: parseInt($('deltaSlider')?.value || '50') };
+  if (selectedOp === 'crop') return { top: parseInt($('cropTop')?.value||0), left: parseInt($('cropLeft')?.value||0), bottom: parseInt($('cropBottom')?.value||0), right: parseInt($('cropRight')?.value||0) };
+  return {};
+}
+
+const fileInput = $('fileInput');
+const uploadZone = $('uploadZone');
+
+uploadZone.addEventListener('dragover', e => { e.preventDefault(); uploadZone.classList.add('drag'); });
+uploadZone.addEventListener('dragleave', () => uploadZone.classList.remove('drag'));
+uploadZone.addEventListener('drop', e => { e.preventDefault(); uploadZone.classList.remove('drag'); if (e.dataTransfer.files[0]) handleFile(e.dataTransfer.files[0]); });
+fileInput.addEventListener('change', () => { if (fileInput.files[0]) handleFile(fileInput.files[0]); });
+
+function handleFile(file) {
+  currentFile = file;
+  const reader = new FileReader();
+  reader.onload = e => {
+    $('previewImg').src = e.target.result;
+    $('previewName').textContent = file.name;
+    $('previewSize').textContent = (file.size / 1024).toFixed(1) + ' KB';
+    $('previewWrap').style.display = 'block';
+    $('uploadedBadge').style.display = 'none';
+    uploadedFileId = null;
+    $('submitBtn').textContent = 'Zpracovat obrázek';
+    $('submitBtn').disabled = false;
+  };
+  reader.readAsDataURL(file);
+}
+
+function setStatus(msg, type = 'info') {
+  $('statusArea').innerHTML = `<div class="status-bar ${type}">${msg}</div>`;
+}
+
+$('submitBtn').addEventListener('click', async () => {
+  const api = $('apiBase').value.replace(/\/+$/, '');
+  const userId = $('userId').value || 'anonymous';
+  const file = currentFile;
+  if (!file) { setStatus('Nejprve vyber obrázek.', 'error'); return; }
+
+  const btn = $('submitBtn');
+  btn.disabled = true;
+
+  try {
+    let fileId = uploadedFileId;
+
+    if (!fileId) {
+      btn.innerHTML = '<span class="spinner"></span>Nahrávám...';
+      setStatus('<span class="spinner"></span>Nahrávám soubor...', 'info');
+      const fd = new FormData();
+      fd.append('file', file);
+      const res = await fetch(`${api}/files/upload`, { method: 'POST', headers: { 'x-user-id': userId }, body: fd });
+      if (!res.ok) throw new Error(`Upload selhal (${res.status}): ${await res.text()}`);
+      const uploaded = await res.json();
+      fileId = uploaded.id;
+      uploadedFileId = fileId;
+      const badge = $('uploadedBadge');
+      badge.textContent = `✓ ${uploaded.filename}  ·  ${fileId.slice(0, 8)}…`;
+      badge.style.display = 'block';
+    }
+
+    btn.innerHTML = '<span class="spinner"></span>Odesílám úlohu...';
+    setStatus('<span class="spinner"></span>Odesílám do image.jobs...', 'info');
+
+    const processRes = await fetch(`${api}/buckets/default/objects/${fileId}/process`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'x-user-id': userId },
+      body: JSON.stringify({ operation: selectedOp, params: getParams() })
+    });
+    if (!processRes.ok) throw new Error(`Process selhal (${processRes.status}): ${await processRes.text()}`);
+
+    const jobInfo = await processRes.json();
+    btn.innerHTML = '<span class="spinner"></span>Čekám na worker...';
+    setStatus(`<span class="spinner"></span>job_id: ${jobInfo.job_id?.slice(0, 8)}… · čekám na image.done`, 'info');
+
+    const newFileId = await waitForResult(api, userId, jobInfo.job_id);
+    const imgRes = await fetch(`${api}/files/${newFileId}`, { headers: { 'x-user-id': userId } });
+    const blob = await imgRes.blob();
+    $('resultImg').src = URL.createObjectURL(blob);
+    $('resultOp').textContent = selectedOp;
+    $('resultFileId').textContent = newFileId.slice(0, 8) + '…';
+    $('resultEmpty').style.display = 'none';
+    $('resultContent').style.display = 'block';
+    setStatus('✓ Hotovo', 'success');
+
+  } catch (e) {
+    setStatus('✕ ' + e.message, 'error');
+  } finally {
+    btn.disabled = false;
+    btn.textContent = 'Zpracovat znovu';
+  }
+});
+
+async function waitForResult(api, userId, jobId) {
+  const brokerUrl = api.replace(/^http/, 'ws') + '/broker';
+  return new Promise((resolve, reject) => {
+    let ws;
+    const timeout = setTimeout(() => { ws?.close(); reject(new Error('Timeout 30s – je worker spuštěný?')); }, 30000);
+    try { ws = new WebSocket(brokerUrl); } catch (e) { clearTimeout(timeout); reject(e); return; }
+    ws.onopen = () => ws.send(JSON.stringify({ action: 'subscribe', topic: 'image.done' }));
+    ws.onmessage = e => {
+      try {
+        const msg = JSON.parse(e.data);
+        if (msg.action === 'deliver') {
+          if (msg.message_id) ws.send(JSON.stringify({ action: 'ack', message_id: msg.message_id }));
+          const p = msg.payload || {};
+          if (p.job_id === jobId) {
+            clearTimeout(timeout); ws.close();
+            if (p.status === 'done') resolve(p.new_file_id);
+            else reject(new Error('Worker: ' + (p.error || 'neznámá chyba')));
+          }
+        }
+      } catch (_) {}
+    };
+    ws.onerror = () => { clearTimeout(timeout); reject(new Error('WebSocket chyba – zkontroluj URL')); };
+  });
+}
+</script>
+</body>
+</html>
