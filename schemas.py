@@ -1,4 +1,4 @@
-from typing import Any, Literal
+from typing import Any, Literal, Optional
 
 from pydantic import BaseModel, Field
 
@@ -6,9 +6,13 @@ class FileMeta(BaseModel):
     id: str
     user_id: str
     filename: str = Field(..., min_length=1)
-    path: str
+    path: str = ""
     size: int = Field(..., gt=0)
     created_at: str
+    status: Optional[str] = "legacy"        # "uploading" | "ready" | "legacy"
+    volume_id: Optional[int] = None
+    offset: Optional[int] = None
+    volume_size: Optional[int] = None
 
     model_config = {
         "from_attributes": True

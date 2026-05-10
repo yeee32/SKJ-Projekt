@@ -5,35 +5,45 @@ from datetime import datetime
 
 Base = declarative_base()
 
+
 class FileModel(Base):
     __tablename__ = "files"
 
-    id = Column(String, primary_key=True, index=True)
-    user_id = Column(String, index=True)
-    filename = Column(String)
-    path = Column(String)
-    size = Column(Integer)
+    id         = Column(String,  primary_key=True, index=True)
+    user_id    = Column(String,  index=True)
+    filename   = Column(String)
+    path       = Column(String,  default="")   # prázdné pro Haystack soubory
+    size       = Column(Integer)               # původní velikost při uploadu
     created_at = Column(String)
 
     bucket_id = Column(String, ForeignKey("buckets.id"))
-    bucket = relationship("Bucket", back_populates="files")
+    bucket    = relationship("Bucket", back_populates="files")
 
     is_deleted = Column(Boolean, default=False)
+
+    # ── Haystack metadata ──────────────────────────────────────
+    # status:      "uploading" → soubor čeká na Haystack ACK
+    #              "ready"     → soubor fyzicky uložen, lze číst
+    #              "legacy"    → starý soubor uložený přímo na disk
+    status      = Column(String,  default="legacy")
+    volume_id   = Column(Integer, nullable=True)   # číslo volume souboru
+    offset      = Column(Integer, nullable=True)   # byte offset v daném volume
+    volume_size = Column(Integer, nullable=True)   # skutečný počet zapsaných bajtů
+
 
 class Bucket(Base):
     __tablename__ = "buckets"
 
-    id = Column(String, primary_key=True, index=True)
-    name = Column(String, unique=True, nullable=False)
+    id         = Column(String, primary_key=True, index=True)
+    name       = Column(String, unique=True, nullable=False)
     created_at = Column(String, default=lambda: datetime.utcnow().isoformat())
 
-    current_storage_bytes = Column(Integer, default=0)
-    ingress_bytes = Column(Integer, default=0)
-    egress_bytes = Column(Integer, default=0)
-    internal_transfer_bytes = Column(Integer, default=0)
-
-    count_write_requests = Column(Integer, default=0)
-    count_read_requests = Column(Integer, default=0)
+    current_storage_bytes    = Column(Integer, default=0)
+    ingress_bytes            = Column(Integer, default=0)
+    egress_bytes             = Column(Integer, default=0)
+    internal_transfer_bytes  = Column(Integer, default=0)
+    count_write_requests     = Column(Integer, default=0)
+    count_read_requests      = Column(Integer, default=0)
 
     files = relationship("FileModel", back_populates="bucket")
 
@@ -41,11 +51,8 @@ class Bucket(Base):
 class QueuedMessage(Base):
     __tablename__ = "queued_messages"
 
-    id = Column(Integer, primary_key=True, autoincrement=True)
-    topic = Column(String, nullable=False, index=True)
-
-    payload = Column(LargeBinary, nullable=False)
-
-    created_at = Column(DateTime, default=datetime.utcnow)
-
-    is_delivered = Column(Boolean, nullable=False, default=False, index=True)
+    id           = Column(Integer,  primary_key=True, autoincrement=True)
+    topic        = Column(String,   nullable=False, index=True)
+    payload      = Column(LargeBinary, nullable=False)
+    created_at   = Column(DateTime, default=datetime.utcnow)
+    is_delivered = Column(Boolean,  nullable=False, default=False, index=True)
