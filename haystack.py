@@ -1,28 +1,22 @@
 """
 haystack.py – Haystack Storage Node
 
-Fyzicky spravuje velké Volume soubory (append-only) a poskytuje
-HTTP endpoint pro čtení dat.
-
-Komunikace:
-  - Naslouchá brokeru na tématu: storage.write
-  - Potvrzení odesílá do tématu:  storage.ack
-
 Spuštění:
-    uvicorn haystack:app --port 8001 --reload
+    uvicorn haystack:app --port 8001
 
-Konfigurace (env proměnné):
-    BROKER_WS_URL   ws://localhost:8000/broker
-    HAYSTACK_DIR    ./volumes
-    MAX_VOLUME_SIZE 104857600   (100 MB)
+Env proměnné:
+    BROKER_URI      ws://127.0.0.1:8000/broker
+    VOLUME_DIR      ./volumes
+    MAX_VOLUME_SIZE 104857600  (100 MB)
+    GATEWAY_URL     http://127.0.0.1:8000
 """
 
-import asyncio
-import json
 import os
-import struct
+import asyncio
+from contextlib import asynccontextmanager
 from pathlib import Path
 
+import httpx
 import msgpack
 import websockets
 from fastapi import FastAPI, HTTPException
@@ -32,290 +26,238 @@ from fastapi.responses import Response
 # KONFIGURACE
 # ======================
 
-BROKER_WS_URL   = os.getenv("BROKER_WS_URL",   "ws://localhost:8000/broker")
-HAYSTACK_DIR    = Path(os.getenv("HAYSTACK_DIR", "./volumes"))
-MAX_VOLUME_SIZE = int(os.getenv("MAX_VOLUME_SIZE", 100 * 1024 * 1024))  # 100 MB
+BROKER_URI      = os.getenv("BROKER_URI",       "ws://127.0.0.1:8000/broker")
+VOLUME_DIR      = os.getenv("VOLUME_DIR",        "volumes")
+MAX_VOLUME_SIZE = int(os.getenv("MAX_VOLUME_SIZE", 100 * 1024 * 1024))
+GATEWAY_URL     = os.getenv("GATEWAY_URL",       "http://127.0.0.1:8000")
 
-TOPIC_WRITE = "storage.write"
-TOPIC_ACK   = "storage.ack"
-
-# ======================
-# STAV APLIKACE
-# ======================
-
-# Aktuálně aktivní volume – číslo a otevřený file handle
-_current_volume_id: int = 1
-_current_file = None          # binární file handle (mode "ab+")
-_volume_lock  = asyncio.Lock()
-
-app = FastAPI(title="Haystack Storage Node", version="1.0.0")
+os.makedirs(VOLUME_DIR, exist_ok=True)
 
 
 # ======================
-# POMOCNÉ FUNKCE PRO VOLUME
+# VOLUME MANAGER
 # ======================
 
-def _volume_path(volume_id: int) -> Path:
-    return HAYSTACK_DIR / f"volume_{volume_id}.dat"
+class VolumeManager:
+    def __init__(self):
+        self.current_volume_id = 1
+        self.file_handle = None
+        self._init_volume()
+
+    def _init_volume(self):
+        files = [f for f in os.listdir(VOLUME_DIR)
+                 if f.startswith("volume_") and f.endswith(".dat")]
+        if files:
+            ids = [int(f.split("_")[1].split(".")[0]) for f in files]
+            self.current_volume_id = max(ids)
+        else:
+            self.current_volume_id = 1
+        self._open_current()
+        size = os.path.getsize(self._current_path())
+        print(f"[haystack] Startuji s volume_{self.current_volume_id}.dat "
+              f"(velikost: {size:,} B, limit: {MAX_VOLUME_SIZE:,} B)")
+
+    def _current_path(self):
+        return os.path.join(VOLUME_DIR, f"volume_{self.current_volume_id}.dat")
+
+    def _open_current(self):
+        if self.file_handle and not self.file_handle.closed:
+            self.file_handle.close()
+        self.file_handle = open(self._current_path(), "ab+")
+
+    def write_data(self, data: bytes) -> tuple[int, int, int]:
+        self.file_handle.seek(0, os.SEEK_END)
+        current_size = self.file_handle.tell()
+
+        if current_size + len(data) > MAX_VOLUME_SIZE:
+            self.current_volume_id += 1
+            self._open_current()
+            print(f"[haystack] Rotace → volume_{self.current_volume_id}.dat")
+            self.file_handle.seek(0, os.SEEK_END)
+
+        offset = self.file_handle.tell()
+        self.file_handle.write(data)
+        self.file_handle.flush()
+        return self.current_volume_id, offset, len(data)
+
+    def read_data(self, volume_id: int, offset: int, size: int) -> bytes | None:
+        path = os.path.join(VOLUME_DIR, f"volume_{volume_id}.dat")
+        if not os.path.exists(path):
+            return None
+        with open(path, "rb") as f:
+            f.seek(offset)
+            return f.read(size)
 
 
-def _open_volume(volume_id: int):
-    """Otevře (nebo vytvoří) volume soubor v append+read binárním režimu."""
-    path = _volume_path(volume_id)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    # "r+b" pokud existuje, jinak vytvoříme přes "a+b"
-    # Vždy používáme "ab+" – seek na tell() dá aktuální konec
-    f = open(path, "ab+")
-    return f
-
-
-def _detect_current_volume() -> int:
-    """Při startu najde nejvyšší existující volume číslo."""
-    HAYSTACK_DIR.mkdir(parents=True, exist_ok=True)
-    ids = []
-    for p in HAYSTACK_DIR.glob("volume_*.dat"):
-        try:
-            num = int(p.stem.split("_")[1])
-            ids.append(num)
-        except (IndexError, ValueError):
-            pass
-    return max(ids) if ids else 1
-
-
-# ======================
-# STARTUP / SHUTDOWN
-# ======================
-
-@app.on_event("startup")
-async def startup_event():
-    global _current_volume_id, _current_file
-
-    HAYSTACK_DIR.mkdir(parents=True, exist_ok=True)
-    _current_volume_id = _detect_current_volume()
-    _current_file = _open_volume(_current_volume_id)
-
-    size = _volume_path(_current_volume_id).stat().st_size
-    print(f"[haystack] Startuji s volume_{_current_volume_id}.dat "
-          f"(aktuální velikost: {size:,} B, limit: {MAX_VOLUME_SIZE:,} B)")
-
-    # Spustíme subscriber na pozadí – nesmí blokovat FastAPI
-    asyncio.create_task(storage_write_subscriber())
-
-
-@app.on_event("shutdown")
-async def shutdown_event():
-    global _current_file
-    if _current_file and not _current_file.closed:
-        _current_file.flush()
-        _current_file.close()
-        print("[haystack] Volume soubor uzavřen.")
+volume_manager = VolumeManager()
 
 
 # ======================
-# APPEND-ONLY ZÁPIS (s rotací)
+# BROKER SUBSCRIBER
 # ======================
 
-async def append_to_volume(data: bytes) -> tuple[int, int, int]:
+async def broker_subscriber():
     """
-    Zapíše data na konec aktivního volume.
-    Pokud by zápis překročil MAX_VOLUME_SIZE, provede rotaci (nový volume).
-
-    Vrátí: (volume_id, offset, size)
+    Naslouchá storage.write přes msgpack WebSocket.
+    Binární data stahuje z Gateway přes HTTP /internal/pending/{object_id}.
     """
-    global _current_volume_id, _current_file
-
-    async with _volume_lock:
-        # Zjistíme aktuální velikost
-        current_size = _volume_path(_current_volume_id).stat().st_size
-
-        # Rotace: nový volume pokud bychom přesáhli limit
-        if current_size + len(data) > MAX_VOLUME_SIZE and current_size > 0:
-            _current_file.flush()
-            _current_file.close()
-            _current_volume_id += 1
-            _current_file = _open_volume(_current_volume_id)
-            print(f"[haystack] Rotace → volume_{_current_volume_id}.dat")
-
-        # Seek na konec (v append módu je tell() = konec, ale pro jistotu)
-        _current_file.seek(0, 2)   # SEEK_END
-        offset = _current_file.tell()
-
-        # Zápis
-        _current_file.write(data)
-        _current_file.flush()       # záruky persistence
-
-        size = len(data)
-        volume_id = _current_volume_id
-
-    return volume_id, offset, size
-
-
-# ======================
-# STORAGE.WRITE SUBSCRIBER
-# ======================
-
-async def storage_write_subscriber():
-    """
-    Naslouchá brokeru na tématu storage.write.
-    Pro každou příchozí zprávu:
-      1. Zapíše binární payload do aktivního volume
-      2. Odešle ACK zprávu do storage.ack
-    Běží jako background task a při výpadku spojení se reconnektuje.
-    """
-    print(f"[haystack] Připojuji subscriber na {BROKER_WS_URL} → '{TOPIC_WRITE}'")
-
     while True:
         try:
-            async with websockets.connect(BROKER_WS_URL) as ws:
-                # Přihlásit se k odběru
-                await ws.send(json.dumps({"action": "subscribe", "topic": TOPIC_WRITE}))
-                raw = await ws.recv()
-                resp = json.loads(raw)
-
-                if resp.get("status") != "subscribed":
-                    print(f"[haystack] Neočekávaná odpověď při subscribe: {resp}")
+            async with websockets.connect(
+                BROKER_URI,
+                max_size=None,
+                ping_interval=None,
+            ) as ws:
+                # Přihlásit se jako msgpack klient
+                await ws.send(msgpack.packb({"action": "subscribe", "topic": "storage.write"}))
+                raw_ack = await ws.recv()
+                ack = msgpack.unpackb(raw_ack, raw=False)
+                if ack.get("status") != "subscribed":
+                    print(f"[haystack] Neočekávaná odpověď subscribe: {ack}")
                     await asyncio.sleep(3)
                     continue
 
-                print(f"[haystack] Subscriber aktivní – naslouchám '{TOPIC_WRITE}'")
+                print(f"[haystack] Subscriber aktivní – naslouchám 'storage.write'")
 
-                async for raw_msg in ws:
+                # Přeskočit historické zprávy
+                print(f"[haystack] Přeskakuji historické zprávy...")
+                while True:
                     try:
-                        # Broker posílá JSON (text frames)
-                        if isinstance(raw_msg, bytes):
-                            msg = msgpack.unpackb(raw_msg, raw=False)
-                        else:
-                            msg = json.loads(raw_msg)
+                        raw = await asyncio.wait_for(ws.recv(), timeout=0.5)
+                        hist = msgpack.unpackb(raw, raw=False)
+                        if hist.get("action") == "deliver":
+                            mid = hist.get("message_id")
+                            if mid:
+                                await ws.send(msgpack.packb({"action": "ack", "message_id": mid}))
+                    except asyncio.TimeoutError:
+                        break
+                    except Exception:
+                        break
+                print(f"[haystack] Čekám na nové zprávy.")
+
+                while True:
+                    try:
+                        raw_msg = await ws.recv()
+                    except websockets.ConnectionClosed:
+                        print("[haystack] Spojení uzavřeno – restartuji...")
+                        break
+
+                    try:
+                        decoded = msgpack.unpackb(raw_msg, raw=False)
                     except Exception as e:
-                        print(f"[haystack] Nelze deserializovat zprávu: {e}")
+                        print(f"[haystack] Nelze dekódovat zprávu: {e}")
                         continue
 
-                    if msg.get("action") != "deliver":
-                        # Může přijít ack odpověď apod. – ignorujeme
+                    if decoded.get("action") != "deliver":
+                        continue
+                    if decoded.get("topic") != "storage.write":
                         continue
 
-                    message_id = msg.get("message_id")
-                    payload    = msg.get("payload", {})
-                    object_id  = payload.get("object_id")
+                    payload   = decoded.get("payload", {})
+                    msg_id    = decoded.get("message_id")
+                    object_id = payload.get("object_id")
 
-                    # Binární data jsou v payloadu jako list bajtů nebo base64 string
-                    raw_data = payload.get("data")
-                    if raw_data is None:
-                        print(f"[haystack] Zpráva bez 'data', přeskakuji (object_id={object_id})")
-                        if message_id:
-                            await ws.send(json.dumps({"action": "ack", "message_id": message_id}))
+                    # Stáhneme data z Gateway přes HTTP
+                    gateway_url = payload.get("gateway_url")
+                    if not gateway_url:
+                        print(f"[haystack] Zpráva bez gateway_url, přeskakuji (object_id={object_id})")
+                        if msg_id:
+                            await ws.send(msgpack.packb({"action": "ack", "message_id": msg_id}))
                         continue
 
-                    # Dekódujeme data – mohou přijít jako list intů (msgpack) nebo bytes
-                    if isinstance(raw_data, (bytes, bytearray)):
-                        file_bytes = bytes(raw_data)
-                    elif isinstance(raw_data, list):
-                        file_bytes = bytes(raw_data)
-                    else:
-                        print(f"[haystack] Neznámý typ dat: {type(raw_data)}, přeskakuji")
-                        if message_id:
-                            await ws.send(json.dumps({"action": "ack", "message_id": message_id}))
+                    try:
+                        async with httpx.AsyncClient(timeout=60.0) as http:
+                            resp = await http.get(gateway_url)
+                            if resp.status_code == 404:
+                                print(f"[haystack] Pending upload nenalezen: {object_id}")
+                                if msg_id:
+                                    await ws.send(msgpack.packb({"action": "ack", "message_id": msg_id}))
+                                continue
+                            resp.raise_for_status()
+                            file_bytes = resp.content
+                    except Exception as e:
+                        print(f"[haystack] Chyba stahování z Gateway: {e}")
+                        if msg_id:
+                            await ws.send(msgpack.packb({"action": "ack", "message_id": msg_id}))
                         continue
 
                     # Zápis do volume
                     try:
-                        volume_id, offset, size = await append_to_volume(file_bytes)
+                        vol_id, offset, size = volume_manager.write_data(file_bytes)
                     except Exception as e:
-                        print(f"[haystack] Chyba při zápisu: {e}")
-                        if message_id:
-                            await ws.send(json.dumps({"action": "ack", "message_id": message_id}))
+                        print(f"[haystack] Chyba zápisu: {e}")
+                        if msg_id:
+                            await ws.send(msgpack.packb({"action": "ack", "message_id": msg_id}))
                         continue
 
                     print(f"[haystack] Zapsáno object_id={object_id} → "
-                          f"vol={volume_id} offset={offset} size={size}")
+                          f"vol={vol_id} offset={offset} size={size}")
 
-                    # ACK brokeru – zpráva přijata
-                    if message_id:
-                        await ws.send(json.dumps({"action": "ack", "message_id": message_id}))
+                    # ACK brokeru
+                    if msg_id:
+                        await ws.send(msgpack.packb({"action": "ack", "message_id": msg_id}))
 
-                    # Odeslat potvrzení do storage.ack
-                    ack_payload = {
-                        "object_id": object_id,
-                        "volume_id": volume_id,
-                        "offset":    offset,
-                        "size":      size,
-                    }
-                    await ws.send(json.dumps({
+                    # Publish storage.ack
+                    await ws.send(msgpack.packb({
                         "action":  "publish",
-                        "topic":   TOPIC_ACK,
-                        "payload": ack_payload,
+                        "topic":   "storage.ack",
+                        "payload": {
+                            "object_id": object_id,
+                            "volume_id": vol_id,
+                            "offset":    offset,
+                            "size":      size,
+                        },
                     }))
-                    # Odpověď na publish nemusíme číst – přijde jako další zpráva
-                    # a naše smyčka ji přeskočí (action != "deliver")
 
         except websockets.ConnectionClosed:
-            print("[haystack] Spojení s brokerem ztraceno – restartuji za 3s...")
+            print("[haystack] Spojení ztraceno – restartuji za 3s...")
             await asyncio.sleep(3)
         except Exception as e:
-            print(f"[haystack] Chyba subscriber: {e} – restartuji za 5s...")
+            print(f"[haystack] Chyba: {e} – restartuji za 5s...")
             await asyncio.sleep(5)
+
+
+# ======================
+# LIFESPAN
+# ======================
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    task = asyncio.create_task(broker_subscriber())
+    yield
+    task.cancel()
+
+
+app = FastAPI(title="Haystack Storage Node", version="2.0.0", lifespan=lifespan)
 
 
 # ======================
 # HTTP ENDPOINT – ČTENÍ
 # ======================
 
-@app.get(
-    "/volume/{volume_id}/{offset}/{size}",
-    summary="Čtení dat z volume souboru",
-    response_class=Response,
-)
+@app.get("/volume/{volume_id}/{offset}/{size}")
 async def read_from_volume(volume_id: int, offset: int, size: int):
-    """
-    Otevře volume_{volume_id}.dat, skočí na offset a vrátí přesně
-    {size} bajtů jako binární odpověď.
-    """
-    path = _volume_path(volume_id)
-
-    if not path.exists():
-        raise HTTPException(status_code=404, detail=f"Volume {volume_id} neexistuje")
-
-    if offset < 0 or size <= 0:
-        raise HTTPException(status_code=400, detail="Neplatný offset nebo size")
-
-    try:
-        # Čtení je rychlá synchronní operace – volume soubory jsou lokální
-        with open(path, "rb") as f:
-            f.seek(offset)
-            data = f.read(size)
-    except OSError as e:
-        raise HTTPException(status_code=500, detail=f"Chyba při čtení: {e}")
-
-    if len(data) == 0:
-        raise HTTPException(status_code=404, detail="Na daném offsetu nejsou žádná data")
-
-    # Vrátíme jako binární stream (S3 Gateway pozná media type z DB)
+    data = volume_manager.read_data(volume_id, offset, size)
+    if data is None:
+        raise HTTPException(status_code=404, detail="Volume nebo soubor nenalezen")
     return Response(content=data, media_type="application/octet-stream")
 
 
 # ======================
-# ADMIN ENDPOINT – SEZNAM VOLUMES
+# ADMIN – SEZNAM VOLUMES
 # ======================
 
-@app.get("/volumes", summary="Seznam existujících volumes a jejich velikostí")
+@app.get("/volumes")
 async def list_volumes():
     result = []
-    for p in sorted(HAYSTACK_DIR.glob("volume_*.dat")):
+    for f in sorted(Path(VOLUME_DIR).glob("volume_*.dat")):
         try:
-            vid = int(p.stem.split("_")[1])
-            result.append({
-                "volume_id": vid,
-                "path":      str(p),
-                "size_bytes": p.stat().st_size,
-            })
+            vid = int(f.stem.split("_")[1])
+            result.append({"volume_id": vid, "path": str(f), "size_bytes": f.stat().st_size})
         except (IndexError, ValueError):
             pass
     return {"volumes": result}
 
-
-# ======================
-# SPUŠTĚNÍ (přímé)
-# ======================
 
 if __name__ == "__main__":
     import uvicorn

@@ -31,7 +31,7 @@ import websockets
 from fastapi import FastAPI, File, UploadFile, HTTPException, Header, Depends, Request, WebSocket, WebSocketDisconnect
 from fastapi.concurrency import run_in_threadpool
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
+from fastapi.responses import StreamingResponse, Response
 from pydantic import BaseModel
 from sqlalchemy import create_engine, event, func, Column, String, Integer, Boolean
 from sqlalchemy.orm import sessionmaker, Session
@@ -47,6 +47,11 @@ HAYSTACK_URL  = os.getenv("HAYSTACK_URL",  "http://localhost:8001")
 
 TOPIC_WRITE = "storage.write"
 TOPIC_ACK   = "storage.ack"
+
+# Dočasné úložiště binárních dat čekajících na převzetí Haystack Nodem
+# klíč = object_id, hodnota = bytes
+# Po stažení Haystackem se záznam smaže
+_pending_uploads: dict[str, bytes] = {}
 
 app = FastAPI(title="S3 Gateway (Haystack)", version="3.0.0")
 app.add_middleware(
@@ -263,7 +268,7 @@ def get_max_id_from_db():
 
 async def storage_ack_listener():
     """
-    Naslouchá brokeru na tématu storage.ack.
+    Naslouchá brokeru na tématu storage.ack přes msgpack.
     Jakmile dorazí potvrzení od Haystack Node, aktualizuje FileModel
     v DB: volume_id, offset, volume_size, status = "ready".
     Billing se účtuje až zde (Eventual Consistency).
@@ -272,10 +277,10 @@ async def storage_ack_listener():
 
     while True:
         try:
-            async with websockets.connect(BROKER_WS_URL) as ws:
-                await ws.send(json.dumps({"action": "subscribe", "topic": TOPIC_ACK}))
+            async with websockets.connect(BROKER_WS_URL, max_size=None, ping_interval=None) as ws:
+                await ws.send(msgpack.packb({"action": "subscribe", "topic": TOPIC_ACK}))
                 raw = await ws.recv()
-                resp = json.loads(raw)
+                resp = msgpack.unpackb(raw, raw=False)
                 if resp.get("status") != "subscribed":
                     print(f"[gateway] Neočekávaná odpověď storage.ack subscribe: {resp}")
                     await asyncio.sleep(3)
@@ -283,10 +288,17 @@ async def storage_ack_listener():
 
                 print(f"[gateway] storage.ack listener aktivní")
 
-                async for raw_msg in ws:
-                    print(f"[gateway][ack-listener] Přijata zpráva: {str(raw_msg)[:120]}")
+                while True:
                     try:
-                        msg = json.loads(raw_msg) if isinstance(raw_msg, str) else msgpack.unpackb(raw_msg, raw=False)
+                        raw_msg = await ws.recv()
+                    except websockets.ConnectionClosed:
+                        print("[gateway] storage.ack listener: spojení ztraceno – restartuji...")
+                        break
+
+                    print(f"[gateway][ack-listener] Přijata zpráva: {str(raw_msg)[:120]}")
+
+                    try:
+                        msg = msgpack.unpackb(raw_msg, raw=False)
                     except Exception:
                         continue
 
@@ -304,14 +316,12 @@ async def storage_ack_listener():
                     if not all(v is not None for v in [object_id, volume_id, offset, size]):
                         print(f"[gateway] Neúplný ACK payload: {payload}")
                         if message_id:
-                            await ws.send(json.dumps({"action": "ack", "message_id": message_id}))
+                            await ws.send(msgpack.packb({"action": "ack", "message_id": message_id}))
                         continue
 
                     print(f"[gateway] Zpracovávám ACK: object_id={object_id} "
                           f"vol={volume_id} offset={offset} size={size}")
 
-                    # Aktualizace DB – hodnoty předáme jako argumenty, ne closure!
-                    # (closure v cyklu by zachytila referenci, ne hodnotu)
                     def _update_db(oid=object_id, vid=volume_id, off=offset, sz=size):
                         db = SessionLocal()
                         try:
@@ -325,13 +335,18 @@ async def storage_ack_listener():
                             record.volume_size = sz
                             record.status      = "ready"
 
-                            # Billing – účtujeme až teď (Eventual Consistency)
                             if record.bucket_id:
                                 bucket = db.query(Bucket).filter(Bucket.id == record.bucket_id).first()
                                 if bucket:
                                     bucket.current_storage_bytes += sz
                                     bucket.ingress_bytes         += sz
                                     db.add(bucket)
+                                    print(f"[gateway] Billing: bucket={record.bucket_id} "
+                                          f"+{sz} bytes, total={bucket.current_storage_bytes}")
+                                else:
+                                    print(f"[gateway] Billing: bucket {record.bucket_id} nenalezen!")
+                            else:
+                                print(f"[gateway] Billing: soubor {oid} nemá bucket_id – přeskočen")
 
                             db.commit()
                             print(f"[gateway] ✓ status=ready: object_id={oid} "
@@ -341,9 +356,8 @@ async def storage_ack_listener():
 
                     await run_in_threadpool(_update_db)
 
-                    # Potvrdíme brokeru
                     if message_id:
-                        await ws.send(json.dumps({"action": "ack", "message_id": message_id}))
+                        await ws.send(msgpack.packb({"action": "ack", "message_id": message_id}))
 
         except websockets.ConnectionClosed:
             print("[gateway] storage.ack listener: spojení ztraceno – restartuji za 3s...")
@@ -530,12 +544,16 @@ async def upload_file(
     db.add(db_file)
     db.commit()
 
-    # Odeslání přes broker do storage.write
-    # Binární data serializujeme jako list bajtů (JSON-safe)
+    # Soubor dočasně uložíme do paměti – Haystack si ho stáhne přes HTTP
+    # (posílání binárních dat přes broker jako JSON list[int] přetěžuje WebSocket)
+    _pending_uploads[file_id] = file_bytes
+
+    # Přes broker pošleme jen metadata (malá zpráva)
     write_payload = {
-        "object_id": file_id,
-        "filename":  file.filename,
-        "data":      list(file_bytes),   # list[int], 0-255
+        "object_id":   file_id,
+        "filename":    file.filename,
+        "size":        size,
+        "gateway_url": f"http://localhost:8000/internal/pending/{file_id}",
     }
 
     mid = next(message_id_counter)
@@ -552,6 +570,28 @@ async def upload_file(
         "status":   "uploading",
         "message":  "Soubor byl přijat a čeká na fyzické uložení (Haystack).",
     }
+
+
+# ======================
+# INTERNÍ ENDPOINT – HAYSTACK SI STÁHNE DATA
+# ======================
+
+@app.get(
+    "/internal/pending/{object_id}",
+    summary="Interní: Haystack si stáhne binární data souboru",
+    include_in_schema=False,   # skryté z /docs
+)
+async def get_pending_upload(object_id: str):
+    """
+    Haystack Node zavolá tento endpoint po přijetí storage.write zprávy.
+    Vrátí binární data souboru a smaže je z paměti.
+    """
+    data = _pending_uploads.get(object_id)
+    if data is None:
+        raise HTTPException(status_code=404, detail="Pending upload nenalezen nebo již stažen")
+    # Smažeme z paměti – data přebírá Haystack
+    del _pending_uploads[object_id]
+    return Response(content=data, media_type="application/octet-stream")
 
 
 # ======================
